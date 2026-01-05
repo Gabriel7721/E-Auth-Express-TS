@@ -14,7 +14,7 @@ export class ChatDatabase {
 
   async list(params: {
     limit: number;
-    before?: Date;
+    before?: Date | undefined;
   }): Promise<ChatMessageEntity[]> {
     const filter: Filter<ChatMessageDoc> = {};
 
