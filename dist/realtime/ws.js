@@ -1,10 +1,8 @@
 import { WebSocketServer, WebSocket } from "ws";
+import { verifyAccessToken } from "../utils/jwt.js";
 import { UserDatabase } from "../modules/user/user.database.js";
 import { ChatDatabase } from "../modules/chat/chat.database.js";
 import { ChatService } from "../modules/chat/chat.service.js";
-import { verifyAccessToken } from "../utils/jwt.js";
-import { text } from "node:stream/consumers";
-import { create } from "node:domain";
 function safeJsonParse(data) {
     try {
         const s = typeof data === "string"
@@ -12,6 +10,9 @@ function safeJsonParse(data) {
             : Buffer.isBuffer(data)
                 ? data.toString("utf8")
                 : null;
+        if (!s)
+            return null;
+        return JSON.parse(s);
     }
     catch {
         return null;
@@ -31,10 +32,10 @@ export function attachWsServer(server) {
         }
     }
     wss.on("connection", async (ws, req) => {
-        const url = new URL(req.url || "", `http://${req.headers.host}`);
+        const url = new URL(req.url ?? "", `http://${req.headers.host}`);
         const token = url.searchParams.get("token");
         if (!token) {
-            ws.close(1000, "Missing Token");
+            ws.close(1008, "Missing token");
             return;
         }
         let payload;
@@ -42,17 +43,21 @@ export function attachWsServer(server) {
             payload = verifyAccessToken(token);
         }
         catch {
-            ws.close(1000, "invalid token");
+            ws.close(1008, "Invalid token");
             return;
         }
         const user = await userDb.findById(payload.sub);
+        if (!user) {
+            ws.close(1008, "User not found");
+            return;
+        }
         ws.user = {
             userId: user._id.toString(),
             email: user.email,
             role: user.role,
         };
         ws.send(JSON.stringify({
-            type: "Websocket connected successfully!",
+            type: "hello",
             data: { userEmail: ws.user.email, role: ws.user.role },
         }));
         broadcast({
@@ -61,24 +66,33 @@ export function attachWsServer(server) {
         });
         ws.on("message", async (raw) => {
             const msg = safeJsonParse(raw);
-            if (msg?.type === "ping")
-                ws.send(JSON.stringify({ type: "Success Connected" }));
-            if (msg?.type === "message") {
+            if (!msg) {
+                ws.send(JSON.stringify({ type: "error", error: { message: "Invalid JSON" } }));
+                return;
+            }
+            if (msg.type === "ping") {
+                ws.send(JSON.stringify({ type: "pong" }));
+                return;
+            }
+            if (msg.type === "message") {
                 if (!ws.user) {
-                    ws.send(JSON.stringify({ type: "error", error: { message: "undefined" } }));
+                    ws.send(JSON.stringify({
+                        type: "error",
+                        error: { message: "Unauthorized" },
+                    }));
                     return;
                 }
                 const saved = await chatService.postMessage({
-                    userId: ws.user?.userId,
-                    userEmail: ws.user?.email,
-                    role: ws.user?.role,
+                    userId: ws.user.userId,
+                    userEmail: ws.user.email,
+                    role: ws.user.role,
                     text: msg.text,
                 });
                 broadcast({
                     type: "message",
                     data: {
-                        id: saved._id,
-                        email: saved.userEmail,
+                        id: saved._id.toString(),
+                        userEmail: saved.userEmail,
                         role: saved.role,
                         text: saved.text,
                         createdAt: saved.createdAt,
@@ -86,8 +100,19 @@ export function attachWsServer(server) {
                 });
                 return;
             }
+            ws.send(JSON.stringify({
+                type: "error",
+                error: { message: "Unknown message type" },
+            }));
         });
-        ws.on("close", () => { });
+        ws.on("close", () => {
+            if (ws.user) {
+                broadcast({
+                    type: "presence",
+                    data: { event: "leave", userEmail: ws.user.email },
+                });
+            }
+        });
     });
     return wss;
 }
